@@ -7,27 +7,33 @@ from pyspark.sql.types import DoubleType
 import re
 from datetime import datetime
 
-
-# Initialize Spark session
+# Initialize Spark
 spark = SparkSession.builder.appName("bronze_silver_gold").getOrCreate()
 
 RAW_DIR = "/app/data"
 BRONZE_DIR = "/app/data/bronze"
 SILVER_DIR = "/app/data/silver"
 GOLD_DIR = "/app/data/gold"
+# Clean existing bronze/silver/gold outputs
+import shutil
+import os
 
-# =========================
+def clean_dir(path):
+    if os.path.exists(path):
+        shutil.rmtree(path)
+        print(f"[CLEAN] Removed old directory: {path}")
+
+for d in [BRONZE_DIR, SILVER_DIR, GOLD_DIR]:
+    clean_dir(d)
+
 # Bronze Layer
-# =========================
 tables = {
-    "feature_clickstream": "feature_clickstream.csv",
-    "features_attributes": "features_attributes.csv",
-    "features_financials": "features_financials.csv",
-    "lms_loan_daily": "lms_loan_daily.csv",
+    "feature_clickstream":"feature_clickstream.csv",
+    "features_attributes":"features_attributes.csv",
+    "features_financials":"features_financials.csv",
+    "lms_loan_daily":"lms_loan_daily.csv",
 }
-
 def norm_colname(c):
-    """Normalize column names: replace spaces/special chars with underscores, convert to lowercase"""
     c = re.sub(r"\s+", "_", c.strip())
     c = re.sub(r"[^0-9a-zA-Z_]", "_", c)
     c = re.sub(r"_+", "_", c)
@@ -46,17 +52,13 @@ for name, file in tables.items():
     )
     out = f"{BRONZE_DIR}/{name}"
     df.write.mode("overwrite").partitionBy("_ingest_date").parquet(out)
-    print(f"[OK] Bronze: {name} -> {out} ({df.count()} rows)")
+    print(f"[OK] {name} -> {out} ({df.count()} rows)")
 
 
-# =========================
 # Silver Layer
-# =========================
-tables = ["feature_clickstream", "features_attributes", "features_financials", "lms_loan_daily"]
+tables = ["feature_clickstream","features_attributes","features_financials","lms_loan_daily"]
 for t in tables:
     df = spark.read.parquet(f"{BRONZE_DIR}/{t}")
-
-    # Drop duplicate columns
     cols = []
     seen = set()
     for c in df.columns:
@@ -64,24 +66,18 @@ for t in tables:
             cols.append(c)
             seen.add(c)
     df = df.select(cols)
-
-    # Show missing values
-    print(f"Missing values in {t}:")
-    df.select([count(when(col(c).isNull(), c)).alias(c) for c in df.columns]).show()
-
-    # Table-specific cleaning logic
-    if t == "feature_clickstream":
+    print("missing values:")
+    df.select([count(when(col(c).isNull(),c)).alias(c) for c in df.columns]).show()
+    if t =="feature_clickstream":
         if "snapshot_date" in df.columns:
-            df = df.withColumn("year", year(col("snapshot_date")))
-            df = df.withColumn("month", month(col("snapshot_date")))
+            df = df.withColumn("year",year(col("snapshot_date")))
+            df = df.withColumn("month",month(col("snapshot_date")))
         if "customer_id" in df.columns and "snapshot_date" in df.columns:
-            df = df.dropDuplicates(["customer_id", "snapshot_date"])
+            df.dropDuplicates(["customer_id","snapshot_date"])
     elif t == "features_attributes":
-        # Clean string columns: trim and lowercase
         for c, dtype in df.dtypes:
-            if dtype == "string":
-                df = df.withColumn(c, trim(lower(col(c))))
-        # Normalize gender values
+            if dtype =="string":
+                df = df.withColumn(c,trim(lower(col(c))))
         if "gender" in df.columns:
             df = df.withColumn(
                 "gender",
@@ -90,34 +86,28 @@ for t in tables:
                 .otherwise("U")
             )
     elif t == "features_financials":
-        # Convert financial values to double
         for c in df.columns:
             if "amount" in c or "balance" in c:
-                df = df.withColumn(c, regexp_replace(col(c), "[$,]", ""))
-                df = df.withColumn(c, col(c).cast(DoubleType()))
+                df = df.withColumn(c,regexp_replace(col(c),"[$,]",""))
+                df = df.withColumn(c,col(c).cast(DoubleType()))
     elif t == "lms_loan_daily":
-        # Convert dates and add overdue flag
         if "loan_date" in df.columns:
-            df = df.withColumn("loan_date", to_date(col("loan_date"), "yyy-MM-dd"))
+            df = df.withColumn("loan_date",to_date(col("loan_date"),"yyy-MM-dd"))
         if "due_date" in df.columns:
-            df = df.withColumn("due_date", to_date(col("due_date"), "yyy-MM-dd"))
+            df = df.withColumn("due_date",to_date(col("due_date"),"yyy-MM-dd"))
         if "due_date" in df.columns and "loan_date" in df.columns:
-            df = df.withColumn("is_overdue", when(col("due_date") < col("loan_date"), lit(1)).otherwise(lit(0)))
-
+            df = df.withColumn("is_overdue",when(col("due_date")<col("loan_date"),lit(1))).otherwise(lit(0))
     out = f"{SILVER_DIR}/{t}"
     df.write.mode("overwrite").parquet(out)
-    print(f"[OK] Silver: {t} -> {out} ({df.count()} rows)")
+    print(f"{t} saved to {out} ({df.count()} rows)")
 
 
-# =========================
 # Gold Layer
-# =========================
 clickstream = spark.read.parquet(f"{SILVER_DIR}/feature_clickstream")
 attributes  = spark.read.parquet(f"{SILVER_DIR}/features_attributes")
 financials  = spark.read.parquet(f"{SILVER_DIR}/features_financials")
 loans       = spark.read.parquet(f"{SILVER_DIR}/lms_loan_daily")
 
-# Aggregate clickstream features (avg, max, min)
 click_agg = (
     clickstream.groupBy("customer_id")
     .agg(
@@ -127,7 +117,6 @@ click_agg = (
     )
 )
 
-# Clean attributes: convert age to int, drop sensitive column
 attr_sel = (
     attributes
     .withColumn("age", regexp_extract(col("age"), r"(\d+)", 1).cast("int"))
@@ -135,7 +124,6 @@ attr_sel = (
     .select("customer_id", "name", "age", "occupation")
 )
 
-# Clean financials: convert income/debt to numeric, transform credit history
 fin_sel = (
     financials
     .withColumn("annual_income", regexp_replace(col("annual_income"), "[^0-9.]", "").cast("double"))
@@ -146,7 +134,6 @@ fin_sel = (
     .drop("credit_history_age", "_source_name", "_source_file", "_ingest_time", "_ingest_date")
 )
 
-# Aggregate loan daily data
 loan_agg = (
     loans.groupBy("customer_id")
     .agg(
@@ -157,7 +144,6 @@ loan_agg = (
     )
 )
 
-# Join all tables into gold dataset
 gold = (
     attr_sel
     .join(fin_sel, "customer_id", "left")
@@ -165,7 +151,6 @@ gold = (
     .join(loan_agg, "customer_id", "left")
 )
 
-# Save final gold dataset
 out = f"{GOLD_DIR}/customer_features"
 gold.write.mode("overwrite").parquet(out)
-print(f"[OK] Gold: dataset saved to {out} ({gold.count()} rows, {len(gold.columns)} columns)")
+print(f"[OK] gold dataset saved to {out} ({gold.count()} rows, {len(gold.columns)} columns)")
