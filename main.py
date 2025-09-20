@@ -6,6 +6,7 @@ from pyspark.sql.functions import (
 from pyspark.sql.types import DoubleType
 import re
 from datetime import datetime
+from pyspark.sql.functions import expr
 
 # Initialize Spark
 spark = SparkSession.builder.appName("bronze_silver_gold").getOrCreate()
@@ -53,6 +54,7 @@ for name, file in tables.items():
     out = f"{BRONZE_DIR}/{name}"
     df.write.mode("overwrite").partitionBy("_ingest_date").parquet(out)
     print(f"[OK] {name} -> {out} ({df.count()} rows)")
+print(f"[DEBUG] {name}: {df.count()} rows loaded from {file}")
 
 
 # Silver Layer
@@ -85,11 +87,12 @@ for t in tables:
                 .when(col("gender").isin("female", "f"), "F")
                 .otherwise("U")
             )
-    elif t == "features_financials":
-        for c in df.columns:
-            if "amount" in c or "balance" in c:
-                df = df.withColumn(c,regexp_replace(col(c),"[$,]",""))
-                df = df.withColumn(c,col(c).cast(DoubleType()))
+        elif t == "features_financials":
+            
+            for c in df.columns:
+                if "amount" in c or "balance" in c:
+                    df = df.withColumn(c, regexp_replace(col(c), "[$,]", ""))
+                    df = df.withColumn(c, expr(f"try_cast({c} as double)"))
     elif t == "lms_loan_daily":
         if "loan_date" in df.columns:
             df = df.withColumn("loan_date",to_date(col("loan_date"),"yyy-MM-dd"))
